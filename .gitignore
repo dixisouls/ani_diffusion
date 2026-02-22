@@ -221,3 +221,6 @@ wandb/
 
 # Checkpoints
 checkpoints/
+
+# Slurm
+*.slurm
