@@ -206,3 +206,18 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Logs
+logs/
+
+# Hugging Face
+hf_cache/
+
+# Outputs
+outputs/
+
+# Weights and Biases
+wandb/
+
+# Checkpoints
+checkpoints/
