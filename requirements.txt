@@ -1,1 +1,6 @@
 loguru==0.7.3
+datasets==4.5.0
+pillow==12.1.1
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+transformers==5.2.0
