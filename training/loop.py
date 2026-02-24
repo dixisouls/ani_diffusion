@@ -53,7 +53,7 @@ def encode_images_to_latents(pixel_values: torch.Tensor, vae) -> torch.Tensor:
         latents: (B, 4, 32, 32) tensor -- scaled latent representation
     """
 
-    latent_dist = vae.encode(pixel_values).latent_dist
+    latent_dist = vae.encode(pixel_values.to(dtype=vae.dtype)).latent_dist
     latents = latent_dist.sample()
     latents = latents * vae.config.scaling_factor
     return latents
@@ -154,7 +154,7 @@ def train_one_step(
     ).sample
 
     # 6. MSE loss between predicted and true noise
-    loss = F.mse_loss(noise_pred, noise)
+    loss = F.mse_loss(noise_pred.float(), noise.float())
 
     # 7. Backward pass (Accelerate handles gradient sync)
     accelerator.backward(loss)
