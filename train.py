@@ -13,10 +13,11 @@ It wires together all modules in order:
     4. Build optimizers and LR scheduler
     5. Build dataloader
     6. Wrap everything with Accelerate
-    7. Check for existing checkpoint and resume if found
-    8. Initialize WandB (only rank 0)
-    9. Enter training loop
-    10. Save checkpoints at regular intervals
+    7. Initialize EMA (after Accelerate wrapping)
+    8. Check for existing checkpoint and resume if found
+    9. Initialize WandB (only rank 0)
+    10. Enter training loop (with EMA update each step)
+    11. Save checkpoints at regular intervals
 
 No training logic here -- training/loop.py handles that.
 No checkpoint management here -- training/checkpoint.py handles that.
@@ -39,6 +40,7 @@ from models.scheduler import build_train_scheduler
 from data.dataset import build_dataloader
 from training.loop import train_one_step
 from training.checkpoint import save_checkpoint, load_checkpoint
+from training.ema import EMAModel
 
 
 def main():
@@ -131,7 +133,25 @@ def main():
     logger.info("Accelerate Wrapping Complete")
 
     # -------------------------------------------------------------
-    # 6. Check for checkpoint and resume
+    # 6. Initialize EMA (after Accelerate wrapping)
+    # -------------------------------------------------------------
+    # EMA must be initialized AFTER accelerator.prepare() because:
+    #   - prepare() wraps UNet in DDP, changing its structure
+    #   - EMAModel handles the .module unwrapping internally
+    #   - EMA shadow params live on CPU, independent of GPU placement
+
+    use_ema = os.environ.get("USE_EMA", "true").lower() == "true"
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.9999))
+    ema_model = None
+
+    if use_ema:
+        ema_model = EMAModel(unet, decay=ema_decay)
+        logger.info(f"EMA enabled | decay={ema_decay}")
+    else:
+        logger.info("EMA disabled")
+
+    # -------------------------------------------------------------
+    # 7. Check for checkpoint and resume
     # -------------------------------------------------------------
     checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "./checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -141,9 +161,10 @@ def main():
     epoch = 0
     best_loss = float("inf")
 
-    metadata = load_checkpoint(accelerator, checkpoint_dir)
+    # Pass ema_model to load_checkpoint so it restores EMA state too
+    metadata = load_checkpoint(accelerator, checkpoint_dir, ema_model=ema_model)
     if metadata is not None:
-        global_steps = metadata["global_steps"]
+        global_steps = metadata["global_step"]
         samples_seen = metadata["samples_seen"]
         epoch = metadata.get("epoch", 0)
         best_loss = metadata.get("best_loss", float("inf"))
@@ -154,15 +175,15 @@ def main():
         )
 
     # -------------------------------------------------------------
-    # 7. Build DataLoader (after checkpoint load to skip seen)
+    # 8. Build DataLoader (after checkpoint load to skip seen)
     # -------------------------------------------------------------
     # The dataloader is built after checkpoint loading because we
     # need samples_seen to skip forward in the streaming dataset
     # We do not wrap the dataloader with Accelerate because
     # it is an IterableDataset -- Accelerate's prepare() would try
     # to use DistributedSampler which does not work with IterableDataset
-    # Instead, each GPU process streams independently, With streaming +
-    # shuffle, each process gets different ordering, whihc provides
+    # Instead, each GPU process streams independently. With streaming +
+    # shuffle, each process gets different ordering, which provides
     # natural data parallelism without explicitly sharding
 
     dataloader = build_dataloader(
@@ -172,7 +193,7 @@ def main():
     logger.info(f"DataLoader built | skipped={samples_seen} samples")
 
     # -------------------------------------------------------------
-    # 8. Initialize WandB (only rank 0)
+    # 9. Initialize WandB (only rank 0)
     # -------------------------------------------------------------
     if accelerator.is_main_process:
         wandb_project = os.environ.get("WANDB_PROJECT", "anime-diffusion")
@@ -188,7 +209,7 @@ def main():
             "lr_scheduler_type": lr_scheduler_type,
             "warmup_steps": warmup_steps,
             "max_train_steps": max_train_steps,
-            "batch__size_per_gpu": int(os.environ.get("BATCH_SIZE_PER_GPU", 16)),
+            "batch_size_per_gpu": int(os.environ.get("BATCH_SIZE_PER_GPU", 16)),
             "num_gpus": accelerator.num_processes,
             "effective_batch_size": int(os.environ.get("BATCH_SIZE_PER_GPU", 16))
             * accelerator.num_processes,
@@ -200,6 +221,8 @@ def main():
             "num_train_timesteps": int(os.environ.get("NUM_TRAIN_TIMESTEPS", 1000)),
             "beta_schedule": os.environ.get("BETA_SCHEDULE", "linear"),
             "grad_clip": float(os.environ.get("GRAD_CLIP", 1.0)),
+            "use_ema": use_ema,
+            "ema_decay": ema_decay if use_ema else None,
             "resumed_from_step": global_steps if metadata else 0,
         }
 
@@ -215,7 +238,7 @@ def main():
         logger.info(f"WandB initialized | project={wandb_project} | mode={wandb_mode}")
 
     # -------------------------------------------------------------
-    # 9. Training Loop
+    # 10. Training Loop
     # -------------------------------------------------------------
     checkpoint_every = int(os.environ.get("CHECKPOINT_EVERY_N_STEPS", 500))
     batch_size = int(os.environ.get("BATCH_SIZE_PER_GPU", 16))
@@ -252,6 +275,10 @@ def main():
             lr_scheduler=lr_scheduler,
             accelerator=accelerator,
         )
+
+        # --- EMA Update (after optimizer step) ---
+        if ema_model is not None:
+            ema_model.update(unet)
 
         global_steps += 1
         samples_seen += batch_size * accelerator.num_processes
@@ -299,6 +326,7 @@ def main():
                 epoch=epoch,
                 best_loss=best_loss,
                 current_loss=avg_loss_interval,
+                ema_model=ema_model,
             )
 
             # Reset interval stats
@@ -306,7 +334,7 @@ def main():
             interval_steps = 0
 
     # -------------------------------------------------------------
-    # 10. Final checkpoint and cleanup
+    # 11. Final checkpoint and cleanup
     # -------------------------------------------------------------
 
     # Save final checkpoint
@@ -322,6 +350,7 @@ def main():
             epoch=epoch,
             best_loss=best_loss,
             current_loss=avg_loss_interval,
+            ema_model=ema_model,
         )
 
     total_time = time.time() - train_start_time
