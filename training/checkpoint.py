@@ -5,6 +5,7 @@ Checkpoinnt management for training state.
 
 Handles:
     - Saving full training state ( UNet, optimizer, LR scheduler, metadata)
+    - Saving EMA state alongside Accelerate state
     - Loading/resuming from existing checkpoints
     - Rotating old checkpoints (keep last N)
     - Saving best checkpoints seperately
@@ -16,12 +17,16 @@ Checkpoints directory structure:
     checkpoints/
         step_500/           # Accelerate state directory
             ...
+            ema_state.pt    # EMA shadow weights (saved separately)
         step_1000/
             ...
+            ema_state.pt
         step_1500/
             ...
+            ema_state.pt
         best/               # Best checkpoint (by lowest loss)
             ...
+            ema_state.pt
         metadata.json        # Global metadata (step, samples_seen, best_loss)
 
 Usage:
@@ -31,10 +36,15 @@ Usage:
 import os
 import json
 import shutil
+from sympy.sets.sets import false
+import torch
 
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Name of the EMA state file inside each checkpoint directory
+EMA_STATE_FILENAME = "ema_state.pt"
 
 # ------------------------------------------------------------
 # Metadata Management
@@ -115,6 +125,49 @@ def load_metadata(checkpoint_dir: str) -> dict:
 
 
 # ------------------------------------------------------------
+# EMA State Save/Load
+# ------------------------------------------------------------
+
+
+def save_ema_state(checkpoint_path: str, ema_model) -> None:
+    """
+    Save EMA state dict to the checkpoint directory.
+
+    Saved separately from Accelerate state because Accelerate
+    does not know about our EMA object.
+
+    Args:
+        checkpoint_path: Path to the specific checkpoint directory (e.g. checkpoints/step_500)
+        ema_model: EMAModel instance
+    """
+    ema_path = os.path.join(checkpoint_path, EMA_STATE_FILENAME)
+    torch.save(ema_model.state_dict(), ema_path)
+    logger.info(f"EMA state saved | path={ema_path}")
+
+
+def load_ema_state(checkpoint_path: str, ema_model) -> bool:
+    """
+    Load EMA state dict from a checkpoint directory.
+
+    Args:
+        checkpoint_path: Path to the specific checkpoint directory
+        ema_model: EMAModel instance to load state into
+
+    Returns:
+        True if EMA state was loaded, False if not found
+    """
+    ema_path = os.path.join(checkpoint_path, EMA_STATE_FILENAME)
+    if not os.path.exists(ema_path):
+        logger.warning(f"No EMA state found at {ema_path} -- EMA will start fresh")
+        return False
+
+    state_dict = torch.load(ema_path, map_location="cpu", weights_only=True)
+    ema_model.load_state_dict(state_dict)
+    logger.info(f"EMA state loaded | path={ema_path}")
+    return True
+
+
+# ------------------------------------------------------------
 # Checkpoint Save
 # ------------------------------------------------------------
 
@@ -127,6 +180,7 @@ def save_checkpoint(
     epoch: int,
     best_loss: float,
     current_loss: float = None,
+    ema_model=None,
 ):
     """
     Save full training checkpoint.
@@ -137,7 +191,7 @@ def save_checkpoint(
         - LR scheduler state dict
         - Accelerator random states
 
-    Additionally saves our custom metadata and manages
+    Additionally saves our custom metadata, EMA state, and manages
     checkpoint rotation.
 
     If current_loss is provided and is lower than best _loss,
@@ -151,6 +205,7 @@ def save_checkpoint(
         - epoch: Current epoch
         - best_loss: Best (lowest) average loss observed
         - current_loss: Loss for current checkpoint interval (optional)
+        - ema_model: EMAModel instance (optional, saved if provided)
 
     Returns:
         best_loss: Updated best loss (may be same as input if no improvement)
@@ -164,6 +219,10 @@ def save_checkpoint(
     accelerator.save_state(checkpoint_path)
 
     if accelerator.is_main_process:
+        # --- Save EMA State (rank 0 only, EMA lives on CPU) ---
+        if ema_model is not None:
+            save_ema_state(checkpoint_path, ema_model)
+
         # --- Save Metadata ---
         save_metadata(
             checkpoint_dir=checkpoint_dir,
@@ -246,17 +305,18 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return latest_path
 
 
-def load_checkpoint(accelerator, checkpoint_dir: str) -> dict | None:
+def load_checkpoint(accelerator, checkpoint_dir: str, ema_model=None) -> dict | None:
     """
     Resume training from the latest checkpoint.
 
     Loads accelerate state (model, optimizer, LR scheduler, random states)
-    and returns the metadata dict so the training loop can restore
-    global_step and samples_seen.
+    and optionally restores EMA state. Returns the metadata dict so the
+    training loop can restore global_step and samples_seen.
 
     Args:
         accelerator: Accelerate instance
         checkpoint_dir: Root checkpoint directory
+        ema_model: EMAModel instance (optional, restored if provided)
 
     Returns:
         metadata dict if checkpoint was loaded, None if starting fresh
@@ -275,6 +335,10 @@ def load_checkpoint(accelerator, checkpoint_dir: str) -> dict | None:
 
     logger.info(f"Resuming from checkpoint | path={latest_path}")
     accelerator.load_state(latest_path)
+
+    # --- Load EMA state if available ---
+    if ema_model is not None:
+        load_ema_state(latest_path, ema_model)
 
     metadata = load_metadata(checkpoint_dir)
     logger.info(
